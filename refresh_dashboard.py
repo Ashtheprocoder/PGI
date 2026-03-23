@@ -141,8 +141,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 .dot-row{display:flex;flex-wrap:wrap;gap:3px;margin-top:4px}
 .dot{width:8px;height:8px;border-radius:50%}
 
-@media(max-width:640px){.g5{grid-template-columns:repeat(3,1fr)}}
-@media(max-width:400px){.g5{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:640px){
+  .g5{grid-template-columns:repeat(3,1fr)}
+  /* Stack streak + dow chart vertically on mobile */
+  .two-detail{grid-template-columns:1fr !important}
+  /* Make month table font smaller */
+  .dt{font-size:11px}
+  .dt th,.dt td{padding:5px 5px}
+  /* Shrink nav pills */
+  .hpill{padding:4px 9px;font-size:11px}
+}
+@media(max-width:400px){
+  .g5{grid-template-columns:repeat(2,1fr)}
+}
 </style>
 </head>
 <body>
@@ -180,7 +191,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 </div>
 
 <!-- Streak history + calendar heatmap -->
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+<div class="two-detail" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
 
   <!-- Top streaks -->
   <div class="card" style="margin-bottom:0">
@@ -584,14 +595,19 @@ function buildCalendar(dailyDone, color) {
 
   document.getElementById('cal-sub').textContent =
     `${dailyDone.length} days · green = done · red = missed`;
+
+  // Auto-scroll to most recent data (right end)
+  const wrap = container.closest('.cal-wrap');
+  if (wrap) wrap.scrollLeft = wrap.scrollWidth;
 }
 
 // ── Month table ───────────────────────────────────────────────────────────────
 function buildMonthTable(name, color) {
   const rows = [...D.monthly].reverse();
+  const isMobile = window.innerWidth < 640;
   let h = `<thead><tr>
-    <th>Month</th><th>Rate</th><th>Days done</th>
-    <th>Days missed</th><th>vs prev month</th>
+    <th>Month</th><th>Rate</th><th>${isMobile?'Done':'Days done'}</th>
+    <th>${isMobile?'Miss':'Days missed'}</th><th>${isMobile?'Trend':'vs prev month'}</th>
   </tr></thead><tbody>`;
 
   let prevRate = null;
@@ -944,7 +960,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 .rk{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;
     border-radius:5px;font-size:11px;font-weight:700;color:#fff;margin-right:4px;flex-shrink:0}
 
-@media(max-width:640px){.g4{grid-template-columns:repeat(2,1fr)}.two{grid-template-columns:1fr}.sgrid-wrap{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:640px){
+  .g4{grid-template-columns:repeat(2,1fr)}
+  .two{grid-template-columns:1fr}
+  .sgrid-wrap{grid-template-columns:repeat(2,1fr)}
+  .dt{font-size:11px}
+  .dt th,.dt td{padding:5px 5px;white-space:nowrap}
+  .dt .hide-mobile{display:none}
+}
 @media(max-width:400px){.sgrid-wrap{grid-template-columns:1fr}}
 </style>
 </head>
@@ -1185,7 +1208,8 @@ buildRates('all');
 // ── Month table ───────────────────────────────────────────────────────────────
 (function(){
   const rows=[...monthly].reverse();
-  let h=`<thead><tr><th>Month</th><th>PGI</th><th>Net</th><th>W/L</th><th>Momentum</th>`;
+  const mob = window.innerWidth < 640;
+  let h=`<thead><tr><th>Month</th><th>PGI</th><th>Net</th><th>W/L</th>${mob?'':'<th>Momentum</th>'}`;
   streaks.forEach(s=>{ h+=`<th>${s.name.split(' ')[0]}</th>`; });
   h+=`</tr></thead><tbody>`;
   rows.forEach(m=>{
