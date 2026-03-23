@@ -120,8 +120,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
                 font-size:9px;color:var(--text3);padding-top:1px}
 
 /* Streak list */
-.streak-list{display:flex;flex-direction:column;gap:6px}
-.streak-row{display:flex;align-items:center;gap:10px;padding:8px 12px;
+.streak-list{display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto}
+.streak-row{display:flex;align-items:center;gap:8px;padding:7px 10px;
             background:var(--bg2);border-radius:var(--rs)}
 .streak-rank{font-size:11px;color:var(--text3);width:20px;text-align:center;flex-shrink:0}
 .streak-bar-wrap{flex:1;height:6px;background:var(--bg3);border-radius:3px;overflow:hidden}
@@ -191,7 +191,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 </div>
 
 <!-- Streak history + calendar heatmap -->
-<div class="two-detail" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+<div class="two-detail" style="display:grid;grid-template-columns:1fr 1.4fr;gap:14px;margin-bottom:14px">
 
   <!-- Top streaks -->
   <div class="card" style="margin-bottom:0">
@@ -204,7 +204,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   <div class="card" style="margin-bottom:0">
     <div class="ch"><div class="ct">Day of week pattern</div>
       <div class="cs">which days you're most consistent</div></div>
-    <div style="position:relative;height:160px"><canvas id="dow-chart"></canvas></div>
+    <div style="position:relative;height:200px"><canvas id="dow-chart"></canvas></div>
   </div>
 
 </div>
@@ -940,6 +940,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 .snum-l{font-size:10px;color:var(--text3);margin-top:3px;text-transform:uppercase;letter-spacing:.04em}
 .cells{display:flex;flex-wrap:wrap;gap:2px}
 .cell{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+@media(max-width:640px){.cell{width:8px;height:8px;gap:1px}}
 
 /* ── Completion bars ──────────────────────────────────────────── */
 .hbr{display:flex;align-items:center;gap:10px;margin-bottom:10px}
