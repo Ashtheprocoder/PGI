@@ -661,6 +661,12 @@ loadData();
 """
 USE_EXCEL   = True   # ← set to False to use thefor data only (clean sample)
 
+# ── Todoist config ────────────────────────────────────────────────────────────
+TODOIST_TOKEN      = "040ddaaaac599dfe619c13c20a0791ed1d4305f1"
+TODOIST_PTS_ONTIME  = 2   # completed on or before due date
+TODOIST_PTS_OVERDUE = 1   # completed after due date
+TODOIST_PTS_NODUE   = 1   # completed with no due date
+
 # ── Find newest thefor export ─────────────────────────────────────────────────
 def find_json():
     files = sorted(SCRIPT_DIR.glob("habits-*.json"), key=lambda p: p.stat().st_mtime)
@@ -796,11 +802,84 @@ def load_excel(cutoff):
         })
     return rows
 
+
+# ── Fetch Todoist completed tasks → {date_str: {on_time: N, overdue: N, no_due: N}} ──
+def fetch_todoist():
+    import urllib.request, urllib.error
+    if not TODOIST_TOKEN:
+        return {}
+
+    print("  Fetching Todoist completed tasks...")
+    task_map = defaultdict(lambda: {"on_time": 0, "overdue": 0, "no_due": 0, "total": 0})
+
+    try:
+        # Sync API to get completed items (supports full history)
+        url = "https://api.todoist.com/sync/v9/items/completed/get_all"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {TODOIST_TOKEN}"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+
+        items = data.get("items", [])
+        print(f"    Found {len(items)} completed tasks")
+
+        for item in items:
+            # completed_at is like "2025-06-15T14:23:00.000000Z"
+            completed_raw = item.get("completed_at") or item.get("date_completed", "")
+            if not completed_raw:
+                continue
+            try:
+                completed_date = datetime.fromisoformat(
+                    completed_raw.replace("Z","").split("T")[0]
+                ).date()
+            except Exception:
+                continue
+
+            ds = str(completed_date)
+
+            # Check if it had a due date and whether it was on time
+            due = item.get("due")
+            if not due:
+                task_map[ds]["no_due"]  += 1
+            else:
+                due_str = due.get("date","")[:10] if isinstance(due, dict) else str(due)[:10]
+                try:
+                    due_date = date.fromisoformat(due_str)
+                    if completed_date <= due_date:
+                        task_map[ds]["on_time"]  += 1
+                    else:
+                        task_map[ds]["overdue"] += 1
+                except Exception:
+                    task_map[ds]["no_due"] += 1
+
+            task_map[ds]["total"] += 1
+
+        return dict(task_map)
+
+    except urllib.error.URLError as e:
+        print(f"    Todoist unavailable: {e} — skipping tasks")
+        return {}
+    except Exception as e:
+        print(f"    Todoist error: {e} — skipping tasks")
+        return {}
+
 # ── Merge excel history + thefor rows ────────────────────────────────────────
-def merge(excel_rows, day_map):
+def merge(excel_rows, day_map, task_map=None):
+    task_map = task_map or {}
     by_date = {r["date"]: r for r in excel_rows}
     for ds in sorted(day_map.keys()):
-        by_date[ds] = {"date": ds, "source": "thefor", "habits": dict(day_map[ds])}
+        by_date[ds] = {
+            "date":   ds,
+            "source": "thefor",
+            "habits": dict(day_map[ds]),
+            "tasks":  task_map.get(ds, {"on_time":0,"overdue":0,"no_due":0,"total":0}),
+        }
+    # Add task data to excel rows too
+    for r in by_date.values():
+        if "tasks" not in r:
+            r["tasks"] = task_map.get(r["date"], {"on_time":0,"overdue":0,"no_due":0,"total":0})
     return [by_date[d] for d in sorted(by_date)]
 
 # ── Running PGI, momentum, per-habit rolling streaks ─────────────────────────
@@ -819,6 +898,11 @@ def calc_metrics(rows):
         else:
             # Penalty scoring: complete = +points, miss = -1
             agg = sum(HABIT_CONFIG[h]["points"] if hab.get(h, 0) else -1 for h in HABIT_NAMES)
+            # Add task completion points
+            tasks = r.get("tasks", {})
+            agg += tasks.get("on_time", 0)  * TODOIST_PTS_ONTIME
+            agg += tasks.get("overdue", 0)  * TODOIST_PTS_OVERDUE
+            agg += tasks.get("no_due", 0)   * TODOIST_PTS_NODUE
             pgi += agg
 
         agg_hist.append(agg)
@@ -832,6 +916,7 @@ def calc_metrics(rows):
             "source":  r["source"],
             "pgi":     round(pgi, 1),
             "habits":  {h: hab.get(h, 0) for h in HABIT_NAMES},
+            "tasks":   r.get("tasks", {"on_time":0,"overdue":0,"no_due":0,"total":0}),
             "agg":     round(agg, 1),
             "mw":      mw,
             "mm":      mm,
@@ -963,6 +1048,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 
 @media(max-width:640px){
   .g4{grid-template-columns:repeat(2,1fr)}
+  div[style*="repeat(5"]{grid-template-columns:repeat(2,1fr) !important}
   .two{grid-template-columns:1fr}
   .sgrid-wrap{grid-template-columns:repeat(2,1fr)}
   .dt{font-size:11px}
@@ -980,11 +1066,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
   <span class="meta" style="margin-left:auto">Updated %%GEN%%</span><span class="meta" style="background:rgba(163,45,45,0.12);color:#a32d2d;padding:2px 8px;border-radius:20px;font-weight:500;margin-left:6px">−1 per missed habit</span>
 </div>
 
-<div class="g4">
+<div style="display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-bottom:14px">
   <div class="mc"><div class="ml">Current PGI</div><div class="mv blue" id="m1">—</div><div class="ms" id="m1s"></div></div>
   <div class="mc"><div class="ml">Days tracked</div><div class="mv teal" id="m2">—</div><div class="ms" id="m2s"></div></div>
   <div class="mc"><div class="ml">Win rate</div><div class="mv" id="m3">—</div><div class="ms" id="m3s"></div></div>
   <div class="mc"><div class="ml">7-day momentum</div><div class="mv" id="m4">—</div><div class="ms">avg daily aggregate</div></div>
+  <div class="mc"><div class="ml">Tasks (all time)</div><div class="mv amber" id="m5">—</div><div class="ms" id="m5s"></div></div>
 </div>
 
 <!-- Main chart -->
@@ -1068,6 +1155,18 @@ document.getElementById('m3s').textContent=`${pos} wins · ${neg} losses`;
 const me=document.getElementById('m4');
 me.textContent=last.mw!=null?(last.mw>0?'+':'')+fmt(last.mw,2):'—';
 me.className='mv '+(last.mw>0?'teal':last.mw<0?'red':'');
+
+// ── Tasks summary ─────────────────────────────────────────────────────────────
+const totalTasks  = daily.reduce((s,d)=>s+(d.tasks&&d.tasks.total||0),0);
+const onTimeTasks = daily.reduce((s,d)=>s+(d.tasks&&d.tasks.on_time||0),0);
+const onTimeRate  = totalTasks ? Math.round(onTimeTasks/totalTasks*100) : 0;
+const t5=document.getElementById('m5');
+if(t5){
+  t5.textContent = totalTasks || '—';
+  t5.className = 'mv amber';
+  const t5s=document.getElementById('m5s');
+  if(t5s) t5s.textContent = totalTasks ? onTimeRate+'% on time' : 'connect Todoist';
+}
 
 // ── Main chart ────────────────────────────────────────────────────────────────
 let mc3, cv='weekly';
@@ -1263,7 +1362,12 @@ def main():
     else:
         print("  No PGI_v3.xlsx — using thefor data only.")
 
-    all_rows = merge(excel_rows, day_map)
+    task_map = fetch_todoist()
+    if task_map:
+        total_tasks = sum(v["total"] for v in task_map.values())
+        print(f"  Todoist: {total_tasks} completed tasks across {len(task_map)} days")
+
+    all_rows = merge(excel_rows, day_map, task_map)
     daily    = calc_metrics(all_rows)
     weekly, monthly = aggregates(daily)
     streaks  = streak_summary(daily)
