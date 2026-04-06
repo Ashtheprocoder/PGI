@@ -667,6 +667,15 @@ TODOIST_PTS_ONTIME  = 2   # completed on or before due date
 TODOIST_PTS_OVERDUE = 1   # completed after due date
 TODOIST_PTS_NODUE   = 1   # completed with no due date
 
+
+HABIT_ALIASES = {
+    "3 Hours of study": "Trading Study",
+    "30 minutes of reading": "Deep Learning",
+    "Journal": "Trading Journal",
+    "Visualization": "Clarity Practice",
+    "No shit": "Shit",
+}
+
 # ── Find newest thefor export ─────────────────────────────────────────────────
 def find_json():
     files = sorted(SCRIPT_DIR.glob("habits-*.json"), key=lambda p: p.stat().st_mtime)
@@ -678,7 +687,10 @@ def find_json():
     return files[-1]
 
 # ── Parse thefor JSON → {date_str: {habit: 1/0}} ────────────────────────────
-def parse_thefor(json_path):
+def parse_thefor(json_path, run_report=None):
+    run_report = run_report if run_report is not None else {}
+    run_report.setdefault("unmatched_habits", [])
+    run_report.setdefault("skipped_checked_days", 0)
     with open(json_path) as f:
         raw = json.load(f)
 
@@ -686,7 +698,10 @@ def parse_thefor(json_path):
 
     for habit in raw:
         title = habit.get("title", "").strip()
+        title = HABIT_ALIASES.get(title, title)
         if title not in HABIT_CONFIG:
+            if title and title not in run_report["unmatched_habits"]:
+                run_report["unmatched_habits"].append(title)
             continue
 
         archived = habit.get("archiveTime", "null")
@@ -701,6 +716,7 @@ def parse_thefor(json_path):
             try:
                 d = datetime.fromisoformat(entry["day"].replace("Z", "")).date()
             except Exception:
+                run_report["skipped_checked_days"] += 1
                 continue
             if archive_date and d > archive_date:
                 continue
@@ -835,6 +851,7 @@ def fetch_todoist():
                     completed_raw.replace("Z","").split("T")[0]
                 ).date()
             except Exception:
+                run_report["skipped_checked_days"] += 1
                 continue
 
             ds = str(completed_date)
@@ -1344,7 +1361,12 @@ def main():
     json_path = find_json()
     print(f"Reading {json_path.name}...")
 
-    day_map = parse_thefor(json_path)
+    run_report = {
+        "unmatched_habits": [],
+        "skipped_checked_days": 0,
+    }
+
+    day_map = parse_thefor(json_path, run_report=run_report)
     if not day_map:
         print("ERROR: No matching habits found. Check HABITS titles match thefor exactly.")
         sys.exit(1)
@@ -1392,6 +1414,7 @@ def main():
     print(f"\nDone! → {OUTPUT_HTML.name} + {OUTPUT_DETAIL.name}")
     print(f"  {len(daily)} days  ·  {len(weekly)} weeks  ·  {len(monthly)} months")
     print(f"  Current PGI: {daily[-1]['pgi']}")
+    print(f"  Parse report: unmatched={len(run_report['unmatched_habits'])}, skipped_checked_days={run_report['skipped_checked_days']}")
     print(f"\n  Habit streaks:")
     for s in streaks:
         bar = "█" * min(s["cur"], 20)
