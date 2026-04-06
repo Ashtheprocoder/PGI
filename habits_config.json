@@ -1,0 +1,38 @@
+[
+  {
+    "name": "Trading Study",
+    "type": "growth",
+    "points": 4,
+    "color": "#0f6e56"
+  },
+  {
+    "name": "Trading Journal",
+    "type": "growth",
+    "points": 2,
+    "color": "#085041"
+  },
+  {
+    "name": "Morning Routine",
+    "type": "positive",
+    "points": 2,
+    "color": "#185fa5"
+  },
+  {
+    "name": "Deep Learning",
+    "type": "positive",
+    "points": 2,
+    "color": "#534ab7"
+  },
+  {
+    "name": "Clarity Practice",
+    "type": "positive",
+    "points": 1,
+    "color": "#ba7517"
+  },
+  {
+    "name": "Shit",
+    "type": "positive",
+    "points": 2,
+    "color": "#1d9e75"
+  }
+]

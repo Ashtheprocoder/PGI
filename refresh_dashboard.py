@@ -21,7 +21,7 @@ Rename these in thefor to preserve streaks:
 Archive: Wake up early, Sunday Spirituality Study, Guitar Practice
 """
 
-import json, sys
+import json, os, sys
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from collections import defaultdict
@@ -33,7 +33,7 @@ from collections import defaultdict
 #  type "positive" = checked when DONE
 #  type "negative" = checked when you SLIPPED (not used currently)
 #  "Shit" is checked when CLEAN — so it's type "positive"
-HABITS = [
+DEFAULT_HABITS = [
     ("Trading Study",    "growth",   +4, "#0f6e56"),
     ("Trading Journal",  "growth",   +2, "#085041"),
     ("Morning Routine",  "positive", +2, "#185fa5"),
@@ -42,14 +42,37 @@ HABITS = [
     ("Shit",             "positive", +2, "#1d9e75"),   # checked = clean day
 ]
 
-HABIT_CONFIG = {h[0]: {"type": h[1], "points": h[2], "color": h[3]} for h in HABITS}
-HABIT_NAMES  = [h[0] for h in HABITS]
-MAX_PTS      = sum(h[2] for h in HABITS if h[2] > 0)
-
 SCRIPT_DIR  = Path(__file__).parent
 EXCEL_FILE  = SCRIPT_DIR / "PGI_v3.xlsx"
 OUTPUT_HTML   = SCRIPT_DIR / "PGI_Dashboard.html"
 OUTPUT_DETAIL = SCRIPT_DIR / "habit_detail.html"
+DATA_FILE   = SCRIPT_DIR / "data" / "latest.json"
+LOCK_FILE   = SCRIPT_DIR / ".refresh.lock"
+HABITS_CONFIG_FILE = SCRIPT_DIR / "habits_config.json"
+
+HABIT_ALIASES = {
+    "3 Hours of study": "Trading Study",
+    "30 minutes of reading": "Deep Learning",
+    "Journal": "Trading Journal",
+    "Visualization": "Clarity Practice",
+    "No shit": "Shit",
+}
+
+def load_habits():
+    if HABITS_CONFIG_FILE.exists():
+        try:
+            data = json.loads(HABITS_CONFIG_FILE.read_text(encoding="utf-8"))
+            habits = [(h["name"], h["type"], int(h["points"]), h["color"]) for h in data]
+            if habits:
+                return habits
+        except Exception as e:
+            print(f"  WARNING: failed reading habits_config.json: {e}. Using defaults.")
+    return DEFAULT_HABITS
+
+HABITS = load_habits()
+HABIT_CONFIG = {h[0]: {"type": h[1], "points": h[2], "color": h[3]} for h in HABITS}
+HABIT_NAMES  = [h[0] for h in HABITS]
+MAX_PTS      = sum(h[2] for h in HABITS if h[2] > 0)
 
 DETAIL_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -244,17 +267,22 @@ let currentHabit = null;
 let rateChart = null, dowChart = null;
 
 function loadData() {
-  // Data is injected at build time by refresh_dashboard.py
-  if (typeof INJECTED_DATA !== 'undefined') {
-    D = INJECTED_DATA;
-    init();
-  } else {
-    document.querySelector('.app').innerHTML =
-      '<div style="padding:40px;text-align:center;color:var(--text2)">' +
-      '<div style="font-size:16px;font-weight:500;margin-bottom:8px">No data found</div>' +
-      '<div style="font-size:13px">Run refresh_dashboard.py to regenerate this file.</div>' +
-      '</div>';
-  }
+  // Prefer external data for lighter deploy artifacts; fallback to injected payload.
+  fetch('data/latest.json')
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('missing latest.json')))
+    .then(data => { D = data; init(); })
+    .catch(() => {
+      if (typeof INJECTED_DATA !== 'undefined') {
+        D = INJECTED_DATA;
+        init();
+      } else {
+        document.querySelector('.app').innerHTML =
+          '<div style="padding:40px;text-align:center;color:var(--text2)">' +
+          '<div style="font-size:16px;font-weight:500;margin-bottom:8px">No data found</div>' +
+          '<div style="font-size:13px">Run refresh_dashboard.py to regenerate this file.</div>' +
+          '</div>';
+      }
+    });
 }
 
 function init() {
@@ -662,7 +690,7 @@ loadData();
 USE_EXCEL   = True   # ← set to False to use thefor data only (clean sample)
 
 # ── Todoist config ────────────────────────────────────────────────────────────
-TODOIST_TOKEN      = "040ddaaaac599dfe619c13c20a0791ed1d4305f1"
+TODOIST_TOKEN      = os.getenv("TODOIST_TOKEN", "")
 TODOIST_PTS_ONTIME  = 2   # completed on or before due date
 TODOIST_PTS_OVERDUE = 1   # completed after due date
 TODOIST_PTS_NODUE   = 1   # completed with no due date
@@ -678,7 +706,10 @@ def find_json():
     return files[-1]
 
 # ── Parse thefor JSON → {date_str: {habit: 1/0}} ────────────────────────────
-def parse_thefor(json_path):
+def parse_thefor(json_path, run_report=None):
+    run_report = run_report if run_report is not None else {}
+    run_report.setdefault("unmatched_habits", [])
+    run_report.setdefault("skipped_checked_days", 0)
     with open(json_path) as f:
         raw = json.load(f)
 
@@ -686,7 +717,10 @@ def parse_thefor(json_path):
 
     for habit in raw:
         title = habit.get("title", "").strip()
+        title = HABIT_ALIASES.get(title, title)
         if title not in HABIT_CONFIG:
+            if title and title not in run_report["unmatched_habits"]:
+                run_report["unmatched_habits"].append(title)
             continue
 
         archived = habit.get("archiveTime", "null")
@@ -701,6 +735,7 @@ def parse_thefor(json_path):
             try:
                 d = datetime.fromisoformat(entry["day"].replace("Z", "")).date()
             except Exception:
+                run_report["skipped_checked_days"] += 1
                 continue
             if archive_date and d > archive_date:
                 continue
@@ -807,7 +842,7 @@ def load_excel(cutoff):
 def fetch_todoist():
     import urllib.request, urllib.error
     if not TODOIST_TOKEN:
-        return {}
+        return {}, {"todoist_ok": False, "todoist_error": "missing_token", "todoist_items": 0}
 
     print("  Fetching Todoist completed tasks...")
     task_map = defaultdict(lambda: {"on_time": 0, "overdue": 0, "no_due": 0, "total": 0})
@@ -856,14 +891,14 @@ def fetch_todoist():
 
             task_map[ds]["total"] += 1
 
-        return dict(task_map)
+        return dict(task_map), {"todoist_ok": True, "todoist_error": None, "todoist_items": len(items)}
 
     except urllib.error.URLError as e:
         print(f"    Todoist unavailable: {e} — skipping tasks")
-        return {}
+        return {}, {"todoist_ok": False, "todoist_error": str(e), "todoist_items": 0}
     except Exception as e:
         print(f"    Todoist error: {e} — skipping tasks")
-        return {}
+        return {}, {"todoist_ok": False, "todoist_error": str(e), "todoist_items": 0}
 
 # ── Merge excel history + thefor rows ────────────────────────────────────────
 def merge(excel_rows, day_map, task_map=None):
@@ -1063,7 +1098,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 <div class="hrow">
   <h1>PGI Dashboard</h1>
   <span class="meta" id="dr"></span>
-  <span class="meta" style="margin-left:auto">Updated %%GEN%%</span><span class="meta" style="background:rgba(163,45,45,0.12);color:#a32d2d;padding:2px 8px;border-radius:20px;font-weight:500;margin-left:6px">−1 per missed habit</span>
+  <span class="meta" style="margin-left:auto">Updated %%GEN%%</span>
+  <span class="meta" id="rr" style="margin-left:6px"></span>
+  <span class="meta" style="background:rgba(163,45,45,0.12);color:#a32d2d;padding:2px 8px;border-radius:20px;font-weight:500;margin-left:6px">−1 per missed habit</span>
 </div>
 
 <div style="display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-bottom:14px">
@@ -1166,6 +1203,16 @@ if(t5){
   t5.className = 'mv amber';
   const t5s=document.getElementById('m5s');
   if(t5s) t5s.textContent = totalTasks ? onTimeRate+'% on time' : 'connect Todoist';
+}
+const rr=document.getElementById('rr');
+if(rr && D.run_report){
+  if(D.run_report.todoist_ok){
+    rr.textContent='Data health: OK';
+    rr.style.color='var(--teal)';
+  }else{
+    rr.textContent='Data health: partial (Todoist unavailable)';
+    rr.style.color='var(--amber)';
+  }
 }
 
 // ── Main chart ────────────────────────────────────────────────────────────────
@@ -1341,62 +1388,97 @@ buildRates('all');
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
-    json_path = find_json()
-    print(f"Reading {json_path.name}...")
-
-    day_map = parse_thefor(json_path)
-    if not day_map:
-        print("ERROR: No matching habits found. Check HABITS titles match thefor exactly.")
+    if LOCK_FILE.exists():
+        print(f"ERROR: lock file exists at {LOCK_FILE}. Another refresh may be running.")
         sys.exit(1)
+    LOCK_FILE.write_text(datetime.now().isoformat(), encoding="utf-8")
 
-    thefor_start = date.fromisoformat(min(day_map.keys()))
-    print(f"  thefor: {min(day_map.keys())} → {max(day_map.keys())}  ({len(day_map)} active days)")
-
-    excel_rows = []
-    if USE_EXCEL and EXCEL_FILE.exists():
-        print(f"  Merging Excel history before {thefor_start}...")
-        excel_rows = load_excel(thefor_start)
-        print(f"  Excel rows: {len(excel_rows)}")
-    elif not USE_EXCEL:
-        print("  Excel disabled — thefor only (clean sample mode).")
-    else:
-        print("  No PGI_v3.xlsx — using thefor data only.")
-
-    task_map = fetch_todoist()
-    if task_map:
-        total_tasks = sum(v["total"] for v in task_map.values())
-        print(f"  Todoist: {total_tasks} completed tasks across {len(task_map)} days")
-
-    all_rows = merge(excel_rows, day_map, task_map)
-    daily    = calc_metrics(all_rows)
-    weekly, monthly = aggregates(daily)
-    streaks  = streak_summary(daily)
-
-    payload = {
-        "daily":    daily,
-        "weekly":   weekly,
-        "monthly":  monthly,
-        "streaks":  streaks,
-        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    run_report = {
+        "todoist_ok": False,
+        "todoist_error": None,
+        "todoist_items": 0,
+        "unmatched_habits": [],
+        "skipped_checked_days": 0,
     }
 
-    html = HTML.replace("%%DATA%%", json.dumps(payload, separators=(',',':')))
-    html = html.replace("%%GEN%%", payload["generated"])
-    OUTPUT_HTML.write_text(html, encoding="utf-8")
+    try:
+        json_path = find_json()
+        print(f"Reading {json_path.name}...")
 
-    # Generate habit detail page with data embedded
-    detail_data = json.dumps(payload, separators=(',',':'))
-    detail_html = DETAIL_TEMPLATE.replace("%%DETAIL_DATA%%", detail_data)
-    OUTPUT_DETAIL.write_text(detail_html, encoding="utf-8")
+        day_map = parse_thefor(json_path, run_report=run_report)
+        if not day_map:
+            print("ERROR: No matching habits found. Check HABITS titles match thefor exactly.")
+            sys.exit(1)
 
-    print(f"\nDone! → {OUTPUT_HTML.name} + {OUTPUT_DETAIL.name}")
-    print(f"  {len(daily)} days  ·  {len(weekly)} weeks  ·  {len(monthly)} months")
-    print(f"  Current PGI: {daily[-1]['pgi']}")
-    print(f"\n  Habit streaks:")
-    for s in streaks:
-        bar = "█" * min(s["cur"], 20)
-        print(f"    {s['name']:20}  streak={s['cur']:3}  best={s['best']:3}  rate={s['rate']:3}%  {bar}")
-    print(f"\nOpen PGI_Dashboard.html in your browser.")
+        thefor_start = date.fromisoformat(min(day_map.keys()))
+        print(f"  thefor: {min(day_map.keys())} → {max(day_map.keys())}  ({len(day_map)} active days)")
+
+        excel_rows = []
+        if USE_EXCEL and EXCEL_FILE.exists():
+            print(f"  Merging Excel history before {thefor_start}...")
+            excel_rows = load_excel(thefor_start)
+            print(f"  Excel rows: {len(excel_rows)}")
+        elif not USE_EXCEL:
+            print("  Excel disabled — thefor only (clean sample mode).")
+        else:
+            print("  No PGI_v3.xlsx — using thefor data only.")
+
+        task_map, todoist_status = fetch_todoist()
+        run_report.update(todoist_status)
+        if task_map:
+            total_tasks = sum(v["total"] for v in task_map.values())
+            print(f"  Todoist: {total_tasks} completed tasks across {len(task_map)} days")
+
+        all_rows = merge(excel_rows, day_map, task_map)
+        daily    = calc_metrics(all_rows)
+        weekly, monthly = aggregates(daily)
+        streaks  = streak_summary(daily)
+
+        # publish guardrails
+        dates = [d["date"] for d in daily]
+        if not daily or not weekly or not monthly:
+            print("ERROR: Missing required aggregates (daily/weekly/monthly).")
+            sys.exit(1)
+        if len(set(dates)) != len(dates):
+            print("ERROR: Duplicate dates detected in daily data.")
+            sys.exit(1)
+        if any(not isinstance(d["pgi"], (int, float)) for d in daily):
+            print("ERROR: Non-numeric PGI detected in daily data.")
+            sys.exit(1)
+
+        payload = {
+            "daily":    daily,
+            "weekly":   weekly,
+            "monthly":  monthly,
+            "streaks":  streaks,
+            "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "run_report": run_report,
+        }
+
+        DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DATA_FILE.write_text(json.dumps(payload, separators=(',', ':')), encoding="utf-8")
+
+        html = HTML.replace("%%DATA%%", json.dumps(payload, separators=(',',':')))
+        html = html.replace("%%GEN%%", payload["generated"])
+        OUTPUT_HTML.write_text(html, encoding="utf-8")
+
+        # Generate habit detail page with data embedded (fallback for file://)
+        detail_data = json.dumps(payload, separators=(',',':'))
+        detail_html = DETAIL_TEMPLATE.replace("%%DETAIL_DATA%%", detail_data)
+        OUTPUT_DETAIL.write_text(detail_html, encoding="utf-8")
+
+        print(f"\nDone! → {OUTPUT_HTML.name} + {OUTPUT_DETAIL.name}")
+        print(f"  {len(daily)} days  ·  {len(weekly)} weeks  ·  {len(monthly)} months")
+        print(f"  Current PGI: {daily[-1]['pgi']}")
+        print(f"  Run report: todoist_ok={run_report['todoist_ok']} skipped_checked_days={run_report['skipped_checked_days']} unmatched={len(run_report['unmatched_habits'])}")
+        print(f"\n  Habit streaks:")
+        for s in streaks:
+            bar = "█" * min(s["cur"], 20)
+            print(f"    {s['name']:20}  streak={s['cur']:3}  best={s['best']:3}  rate={s['rate']:3}%  {bar}")
+        print(f"\nOpen PGI_Dashboard.html in your browser.")
+    finally:
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
 
 if __name__ == "__main__":
     main()
