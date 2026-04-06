@@ -691,6 +691,7 @@ def parse_thefor(json_path, run_report=None):
     run_report = run_report if run_report is not None else {}
     run_report.setdefault("unmatched_habits", [])
     run_report.setdefault("skipped_checked_days", 0)
+
     with open(json_path) as f:
         raw = json.load(f)
 
@@ -851,7 +852,6 @@ def fetch_todoist():
                     completed_raw.replace("Z","").split("T")[0]
                 ).date()
             except Exception:
-                run_report["skipped_checked_days"] += 1
                 continue
 
             ds = str(completed_date)
