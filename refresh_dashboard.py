@@ -21,7 +21,7 @@ Rename these in thefor to preserve streaks:
 Archive: Wake up early, Sunday Spirituality Study, Guitar Practice
 """
 
-import json, sys
+import json, os, sys
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from collections import defaultdict
@@ -662,7 +662,7 @@ loadData();
 USE_EXCEL   = True   # ← set to False to use thefor data only (clean sample)
 
 # ── Todoist config ────────────────────────────────────────────────────────────
-TODOIST_TOKEN      = "040ddaaaac599dfe619c13c20a0791ed1d4305f1"
+TODOIST_TOKEN      = os.getenv("TODOIST_TOKEN", "")
 TODOIST_PTS_ONTIME  = 2   # completed on or before due date
 TODOIST_PTS_OVERDUE = 1   # completed after due date
 TODOIST_PTS_NODUE   = 1   # completed with no due date
