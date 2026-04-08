@@ -25,6 +25,7 @@ import json, os, sys
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from collections import defaultdict
+from contextlib import contextmanager
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HABIT CONFIG  —  exact titles as they appear in thefor, case-sensitive
@@ -50,6 +51,9 @@ SCRIPT_DIR  = Path(__file__).parent
 EXCEL_FILE  = SCRIPT_DIR / "PGI_v3.xlsx"
 OUTPUT_HTML   = SCRIPT_DIR / "PGI_Dashboard.html"
 OUTPUT_DETAIL = SCRIPT_DIR / "habit_detail.html"
+DATA_DIR      = SCRIPT_DIR / "data"
+LATEST_JSON   = DATA_DIR / "latest.json"
+LOCK_FILE     = SCRIPT_DIR / ".refresh_dashboard.lock"
 
 DETAIL_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -680,11 +684,47 @@ HABIT_ALIASES = {
 def find_json():
     files = sorted(SCRIPT_DIR.glob("habits-*.json"), key=lambda p: p.stat().st_mtime)
     if not files:
-        print("ERROR: No habits-*.json found. Export from thefor and drop it here.")
-        sys.exit(1)
+        return None
     if len(files) > 1:
         print(f"  Multiple exports — using newest: {files[-1].name}")
     return files[-1]
+
+@contextmanager
+def run_lock():
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        print(f"ERROR: Lock file exists: {LOCK_FILE.name}. Another refresh may be running.")
+        sys.exit(1)
+    try:
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        yield
+    finally:
+        os.close(fd)
+        try:
+            LOCK_FILE.unlink()
+        except FileNotFoundError:
+            pass
+
+def load_latest_payload():
+    if not LATEST_JSON.exists():
+        return None
+    try:
+        with open(LATEST_JSON, encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return None
+        if not payload.get("daily"):
+            return None
+        return payload
+    except Exception:
+        return None
+
+def write_json_atomic(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    tmp.replace(path)
 
 # ── Parse thefor JSON → {date_str: {habit: 1/0}} ────────────────────────────
 def parse_thefor(json_path, run_report=None):
@@ -694,6 +734,11 @@ def parse_thefor(json_path, run_report=None):
 
     with open(json_path) as f:
         raw = json.load(f)
+    if isinstance(raw, dict):
+        raw = raw.get("habits", [])
+    if not isinstance(raw, list):
+        run_report["raw_format_error"] = True
+        return {}
 
     day_map = defaultdict(lambda: {h: 0 for h in HABIT_NAMES})
 
@@ -1165,7 +1210,7 @@ document.getElementById('dr').textContent=daily[0].date+' → '+last.date;
 document.getElementById('m2').textContent=daily.length;
 document.getElementById('m2s').textContent='since '+daily[0].date;
 const pos=daily.filter(d=>(d.agg||0)>0).length, neg=daily.filter(d=>(d.agg||0)<0).length;
-const wr=Math.round(pos/(pos+neg)*100);
+const wr=(pos+neg)>0?Math.round(pos/(pos+neg)*100):0;
 const we=document.getElementById('m3');
 we.textContent=wr+'%'; we.className='mv '+(wr>=55?'teal':wr>=45?'amber':'red');
 document.getElementById('m3s').textContent=`${pos} wins · ${neg} losses`;
@@ -1358,68 +1403,86 @@ buildRates('all');
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
-    json_path = find_json()
-    print(f"Reading {json_path.name}...")
+    with run_lock():
+        json_path = find_json()
+        run_report = {
+            "unmatched_habits": [],
+            "skipped_checked_days": 0,
+        }
 
-    run_report = {
-        "unmatched_habits": [],
-        "skipped_checked_days": 0,
-    }
+        if json_path is None:
+            print("  No habits-*.json found. Trying fallback data/latest.json ...")
+            payload = load_latest_payload()
+            if payload is None:
+                print("ERROR: No habits export and no fallback payload found.")
+                sys.exit(1)
+            print("  Using fallback payload from data/latest.json")
+        else:
+            print(f"Reading {json_path.name}...")
+            day_map = parse_thefor(json_path, run_report=run_report)
+            if not day_map:
+                print("  No matching habits found in export. Trying fallback data/latest.json ...")
+                payload = load_latest_payload()
+                if payload is None:
+                    print("ERROR: No matching habits and no fallback payload found.")
+                    sys.exit(1)
+                print("  Using fallback payload from data/latest.json")
+            else:
+                thefor_start = date.fromisoformat(min(day_map.keys()))
+                print(f"  thefor: {min(day_map.keys())} → {max(day_map.keys())}  ({len(day_map)} active days)")
 
-    day_map = parse_thefor(json_path, run_report=run_report)
-    if not day_map:
-        print("ERROR: No matching habits found. Check HABITS titles match thefor exactly.")
-        sys.exit(1)
+                excel_rows = []
+                if USE_EXCEL and EXCEL_FILE.exists():
+                    print(f"  Merging Excel history before {thefor_start}...")
+                    excel_rows = load_excel(thefor_start)
+                    print(f"  Excel rows: {len(excel_rows)}")
+                elif not USE_EXCEL:
+                    print("  Excel disabled — thefor only (clean sample mode).")
+                else:
+                    print("  No PGI_v3.xlsx — using thefor data only.")
 
-    thefor_start = date.fromisoformat(min(day_map.keys()))
-    print(f"  thefor: {min(day_map.keys())} → {max(day_map.keys())}  ({len(day_map)} active days)")
+                task_map = fetch_todoist()
+                if task_map:
+                    total_tasks = sum(v["total"] for v in task_map.values())
+                    print(f"  Todoist: {total_tasks} completed tasks across {len(task_map)} days")
 
-    excel_rows = []
-    if USE_EXCEL and EXCEL_FILE.exists():
-        print(f"  Merging Excel history before {thefor_start}...")
-        excel_rows = load_excel(thefor_start)
-        print(f"  Excel rows: {len(excel_rows)}")
-    elif not USE_EXCEL:
-        print("  Excel disabled — thefor only (clean sample mode).")
-    else:
-        print("  No PGI_v3.xlsx — using thefor data only.")
+                all_rows = merge(excel_rows, day_map, task_map)
+                daily    = calc_metrics(all_rows)
+                weekly, monthly = aggregates(daily)
+                streaks  = streak_summary(daily)
 
-    task_map = fetch_todoist()
-    if task_map:
-        total_tasks = sum(v["total"] for v in task_map.values())
-        print(f"  Todoist: {total_tasks} completed tasks across {len(task_map)} days")
+                payload = {
+                    "daily":    daily,
+                    "weekly":   weekly,
+                    "monthly":  monthly,
+                    "streaks":  streaks,
+                    "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                }
 
-    all_rows = merge(excel_rows, day_map, task_map)
-    daily    = calc_metrics(all_rows)
-    weekly, monthly = aggregates(daily)
-    streaks  = streak_summary(daily)
+        html = HTML.replace("%%DATA%%", json.dumps(payload, separators=(',',':')))
+        html = html.replace("%%GEN%%", payload.get("generated", datetime.now().strftime("%Y-%m-%d %H:%M")))
+        OUTPUT_HTML.write_text(html, encoding="utf-8")
 
-    payload = {
-        "daily":    daily,
-        "weekly":   weekly,
-        "monthly":  monthly,
-        "streaks":  streaks,
-        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
-    }
+        detail_data = json.dumps(payload, separators=(',',':'))
+        detail_html = DETAIL_TEMPLATE.replace("%%DETAIL_DATA%%", detail_data)
+        OUTPUT_DETAIL.write_text(detail_html, encoding="utf-8")
+        write_json_atomic(LATEST_JSON, payload)
 
-    html = HTML.replace("%%DATA%%", json.dumps(payload, separators=(',',':')))
-    html = html.replace("%%GEN%%", payload["generated"])
-    OUTPUT_HTML.write_text(html, encoding="utf-8")
+        daily = payload.get("daily", [])
+        weekly = payload.get("weekly", [])
+        monthly = payload.get("monthly", [])
+        streaks = payload.get("streaks", [])
 
-    # Generate habit detail page with data embedded
-    detail_data = json.dumps(payload, separators=(',',':'))
-    detail_html = DETAIL_TEMPLATE.replace("%%DETAIL_DATA%%", detail_data)
-    OUTPUT_DETAIL.write_text(detail_html, encoding="utf-8")
-
-    print(f"\nDone! → {OUTPUT_HTML.name} + {OUTPUT_DETAIL.name}")
-    print(f"  {len(daily)} days  ·  {len(weekly)} weeks  ·  {len(monthly)} months")
-    print(f"  Current PGI: {daily[-1]['pgi']}")
-    print(f"  Parse report: unmatched={len(run_report['unmatched_habits'])}, skipped_checked_days={run_report['skipped_checked_days']}")
-    print(f"\n  Habit streaks:")
-    for s in streaks:
-        bar = "█" * min(s["cur"], 20)
-        print(f"    {s['name']:20}  streak={s['cur']:3}  best={s['best']:3}  rate={s['rate']:3}%  {bar}")
-    print(f"\nOpen PGI_Dashboard.html in your browser.")
+        print(f"\nDone! → {OUTPUT_HTML.name} + {OUTPUT_DETAIL.name}")
+        print(f"  {len(daily)} days  ·  {len(weekly)} weeks  ·  {len(monthly)} months")
+        if daily:
+            print(f"  Current PGI: {daily[-1]['pgi']}")
+        print(f"  Parse report: unmatched={len(run_report['unmatched_habits'])}, skipped_checked_days={run_report['skipped_checked_days']}")
+        print(f"\n  Habit streaks:")
+        for s in streaks:
+            bar = "█" * min(s["cur"], 20)
+            print(f"    {s['name']:20}  streak={s['cur']:3}  best={s['best']:3}  rate={s['rate']:3}%  {bar}")
+        print(f"\nOpen PGI_Dashboard.html in your browser.")
 
 if __name__ == "__main__":
     main()
