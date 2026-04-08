@@ -25,6 +25,7 @@ import json, os, sys
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from collections import defaultdict
+from contextlib import contextmanager
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HABIT CONFIG  —  exact titles as they appear in thefor, case-sensitive
@@ -50,6 +51,9 @@ SCRIPT_DIR  = Path(__file__).parent
 EXCEL_FILE  = SCRIPT_DIR / "PGI_v3.xlsx"
 OUTPUT_HTML   = SCRIPT_DIR / "PGI_Dashboard.html"
 OUTPUT_DETAIL = SCRIPT_DIR / "habit_detail.html"
+DATA_DIR      = SCRIPT_DIR / "data"
+LATEST_JSON   = DATA_DIR / "latest.json"
+LOCK_FILE     = SCRIPT_DIR / ".refresh_dashboard.lock"
 
 DETAIL_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -680,11 +684,47 @@ HABIT_ALIASES = {
 def find_json():
     files = sorted(SCRIPT_DIR.glob("habits-*.json"), key=lambda p: p.stat().st_mtime)
     if not files:
-        print("ERROR: No habits-*.json found. Export from thefor and drop it here.")
-        sys.exit(1)
+        return None
     if len(files) > 1:
         print(f"  Multiple exports — using newest: {files[-1].name}")
     return files[-1]
+
+@contextmanager
+def run_lock():
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        print(f"ERROR: Lock file exists: {LOCK_FILE.name}. Another refresh may be running.")
+        sys.exit(1)
+    try:
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        yield
+    finally:
+        os.close(fd)
+        try:
+            LOCK_FILE.unlink()
+        except FileNotFoundError:
+            pass
+
+def load_latest_payload():
+    if not LATEST_JSON.exists():
+        return None
+    try:
+        with open(LATEST_JSON, encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return None
+        if not payload.get("daily"):
+            return None
+        return payload
+    except Exception:
+        return None
+
+def write_json_atomic(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    tmp.replace(path)
 
 # ── Parse thefor JSON → {date_str: {habit: 1/0}} ────────────────────────────
 def parse_thefor(json_path, run_report=None):
@@ -694,6 +734,11 @@ def parse_thefor(json_path, run_report=None):
 
     with open(json_path) as f:
         raw = json.load(f)
+    if isinstance(raw, dict):
+        raw = raw.get("habits", [])
+    if not isinstance(raw, list):
+        run_report["raw_format_error"] = True
+        return {}
 
     day_map = defaultdict(lambda: {h: 0 for h in HABIT_NAMES})
 
@@ -881,6 +926,113 @@ def fetch_todoist():
     except Exception as e:
         print(f"    Todoist error: {e} — skipping tasks")
         return {}
+
+def fetch_todoist_overview():
+    import urllib.request, urllib.error
+    if not TODOIST_TOKEN:
+        return {"projects": [], "open_tasks": [], "sync_error": None, "connected": False}
+
+    headers = {"Authorization": f"Bearer {TODOIST_TOKEN}"}
+    out = {"projects": [], "open_tasks": [], "sync_error": None, "connected": True}
+    try:
+        # Open tasks (REST API)
+        req_tasks = urllib.request.Request("https://api.todoist.com/rest/v2/tasks", headers=headers)
+        with urllib.request.urlopen(req_tasks, timeout=15) as r:
+            out["open_tasks"] = json.loads(r.read())
+
+        # Projects (REST API)
+        req_projects = urllib.request.Request("https://api.todoist.com/rest/v2/projects", headers=headers)
+        with urllib.request.urlopen(req_projects, timeout=15) as r:
+            out["projects"] = json.loads(r.read())
+    except urllib.error.URLError as e:
+        out["sync_error"] = str(e)
+    except Exception as e:
+        out["sync_error"] = str(e)
+    return out
+
+def build_mvp_overview(daily, streaks, todoist_overview, excel_rows_count):
+    today = date.today()
+    last7 = daily[-7:] if daily else []
+    wins = sum(1 for d in last7 if d.get("agg", 0) > 0)
+    losses = sum(1 for d in last7 if d.get("agg", 0) < 0)
+    weekly_net = round(sum(d.get("agg", 0) for d in last7), 1) if last7 else 0
+    last = daily[-1] if daily else {"pgi": 0, "mw": 0}
+
+    focus = sorted(streaks, key=lambda s: (s.get("cur", 0), s.get("points", 0)), reverse=True)[:3]
+    current_focus = [{"name": s["name"], "streak": s["cur"], "rate": s["rate"]} for s in focus]
+
+    projects = todoist_overview.get("projects", []) if isinstance(todoist_overview, dict) else []
+    open_tasks = todoist_overview.get("open_tasks", []) if isinstance(todoist_overview, dict) else []
+    project_name = {p.get("id"): p.get("name", "Unknown") for p in projects if isinstance(p, dict)}
+    counts_by_project = defaultdict(int)
+
+    due_today = overdue = due_7d = 0
+    upcoming = []
+    for t in open_tasks:
+        if not isinstance(t, dict):
+            continue
+        counts_by_project[t.get("project_id")] += 1
+        due = t.get("due") or {}
+        due_str = due.get("date", "")[:10] if isinstance(due, dict) else str(due)[:10]
+        if due_str:
+            try:
+                due_date = date.fromisoformat(due_str)
+                if due_date < today:
+                    overdue += 1
+                if due_date == today:
+                    due_today += 1
+                if today <= due_date <= (today + timedelta(days=7)):
+                    due_7d += 1
+                upcoming.append({
+                    "content": t.get("content", ""),
+                    "project": project_name.get(t.get("project_id"), "Unknown"),
+                    "due": due_str,
+                })
+            except Exception:
+                pass
+
+    top_projects = sorted(
+        [{"name": project_name.get(pid, "Unknown"), "open_tasks": c} for pid, c in counts_by_project.items()],
+        key=lambda x: x["open_tasks"],
+        reverse=True,
+    )[:5]
+    upcoming = sorted(upcoming, key=lambda x: x["due"])[:10]
+
+    return {
+        "unified_model_version": 1,
+        "sync_status": {
+            "thefor_connected": True,
+            "excel_rows_merged": excel_rows_count,
+            "todoist_connected": bool(todoist_overview.get("connected")),
+            "todoist_sync_error": todoist_overview.get("sync_error"),
+        },
+        "tasks_overview": {
+            "open_total": len(open_tasks),
+            "due_today": due_today,
+            "overdue": overdue,
+            "due_next_7_days": due_7d,
+        },
+        "projects_overview": top_projects,
+        "deadline_visibility": {
+            "overdue_count": overdue,
+            "due_today_count": due_today,
+            "upcoming_count": len(upcoming),
+            "upcoming_items": upcoming,
+        },
+        "current_focus": current_focus,
+        "growth_score": {
+            "current_pgi": last.get("pgi", 0),
+            "momentum_7d": last.get("mw", 0),
+            "simple_score": round(last.get("pgi", 0) + max(0, last.get("mw", 0)) * 10, 1),
+        },
+        "weekly_review": {
+            "window_days": len(last7),
+            "wins": wins,
+            "losses": losses,
+            "net_points": weekly_net,
+            "win_rate": round((wins / (wins + losses) * 100), 1) if (wins + losses) else 0.0,
+        },
+    }
 
 # ── Merge excel history + thefor rows ────────────────────────────────────────
 def merge(excel_rows, day_map, task_map=None):
@@ -1165,7 +1317,7 @@ document.getElementById('dr').textContent=daily[0].date+' → '+last.date;
 document.getElementById('m2').textContent=daily.length;
 document.getElementById('m2s').textContent='since '+daily[0].date;
 const pos=daily.filter(d=>(d.agg||0)>0).length, neg=daily.filter(d=>(d.agg||0)<0).length;
-const wr=Math.round(pos/(pos+neg)*100);
+const wr=(pos+neg)>0?Math.round(pos/(pos+neg)*100):0;
 const we=document.getElementById('m3');
 we.textContent=wr+'%'; we.className='mv '+(wr>=55?'teal':wr>=45?'amber':'red');
 document.getElementById('m3s').textContent=`${pos} wins · ${neg} losses`;
@@ -1358,68 +1510,92 @@ buildRates('all');
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
-    json_path = find_json()
-    print(f"Reading {json_path.name}...")
+    with run_lock():
+        json_path = find_json()
+        run_report = {
+            "unmatched_habits": [],
+            "skipped_checked_days": 0,
+        }
 
-    run_report = {
-        "unmatched_habits": [],
-        "skipped_checked_days": 0,
-    }
+        if json_path is None:
+            print("  No habits-*.json found. Trying fallback data/latest.json ...")
+            payload = load_latest_payload()
+            if payload is None:
+                print("ERROR: No habits export and no fallback payload found.")
+                sys.exit(1)
+            print("  Using fallback payload from data/latest.json")
+        else:
+            print(f"Reading {json_path.name}...")
+            day_map = parse_thefor(json_path, run_report=run_report)
+            if not day_map:
+                print("  No matching habits found in export. Trying fallback data/latest.json ...")
+                payload = load_latest_payload()
+                if payload is None:
+                    print("ERROR: No matching habits and no fallback payload found.")
+                    sys.exit(1)
+                print("  Using fallback payload from data/latest.json")
+            else:
+                thefor_start = date.fromisoformat(min(day_map.keys()))
+                print(f"  thefor: {min(day_map.keys())} → {max(day_map.keys())}  ({len(day_map)} active days)")
 
-    day_map = parse_thefor(json_path, run_report=run_report)
-    if not day_map:
-        print("ERROR: No matching habits found. Check HABITS titles match thefor exactly.")
-        sys.exit(1)
+                excel_rows = []
+                if USE_EXCEL and EXCEL_FILE.exists():
+                    print(f"  Merging Excel history before {thefor_start}...")
+                    excel_rows = load_excel(thefor_start)
+                    print(f"  Excel rows: {len(excel_rows)}")
+                elif not USE_EXCEL:
+                    print("  Excel disabled — thefor only (clean sample mode).")
+                else:
+                    print("  No PGI_v3.xlsx — using thefor data only.")
 
-    thefor_start = date.fromisoformat(min(day_map.keys()))
-    print(f"  thefor: {min(day_map.keys())} → {max(day_map.keys())}  ({len(day_map)} active days)")
+                task_map = fetch_todoist()
+                todoist_overview = fetch_todoist_overview()
+                if task_map:
+                    total_tasks = sum(v["total"] for v in task_map.values())
+                    print(f"  Todoist: {total_tasks} completed tasks across {len(task_map)} days")
+                if todoist_overview.get("connected"):
+                    print(f"  Todoist open tasks: {len(todoist_overview.get('open_tasks', []))}")
+                if todoist_overview.get("sync_error"):
+                    print(f"  Todoist overview sync warning: {todoist_overview['sync_error']}")
 
-    excel_rows = []
-    if USE_EXCEL and EXCEL_FILE.exists():
-        print(f"  Merging Excel history before {thefor_start}...")
-        excel_rows = load_excel(thefor_start)
-        print(f"  Excel rows: {len(excel_rows)}")
-    elif not USE_EXCEL:
-        print("  Excel disabled — thefor only (clean sample mode).")
-    else:
-        print("  No PGI_v3.xlsx — using thefor data only.")
+                all_rows = merge(excel_rows, day_map, task_map)
+                daily    = calc_metrics(all_rows)
+                weekly, monthly = aggregates(daily)
+                streaks  = streak_summary(daily)
 
-    task_map = fetch_todoist()
-    if task_map:
-        total_tasks = sum(v["total"] for v in task_map.values())
-        print(f"  Todoist: {total_tasks} completed tasks across {len(task_map)} days")
+                payload = {
+                    "daily":    daily,
+                    "weekly":   weekly,
+                    "monthly":  monthly,
+                    "streaks":  streaks,
+                    "mvp":      build_mvp_overview(daily, streaks, todoist_overview, len(excel_rows)),
+                    "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                }
 
-    all_rows = merge(excel_rows, day_map, task_map)
-    daily    = calc_metrics(all_rows)
-    weekly, monthly = aggregates(daily)
-    streaks  = streak_summary(daily)
+        html = HTML.replace("%%DATA%%", json.dumps(payload, separators=(',',':')))
+        html = html.replace("%%GEN%%", payload.get("generated", datetime.now().strftime("%Y-%m-%d %H:%M")))
+        OUTPUT_HTML.write_text(html, encoding="utf-8")
 
-    payload = {
-        "daily":    daily,
-        "weekly":   weekly,
-        "monthly":  monthly,
-        "streaks":  streaks,
-        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
-    }
+        detail_data = json.dumps(payload, separators=(',',':'))
+        detail_html = DETAIL_TEMPLATE.replace("%%DETAIL_DATA%%", detail_data)
+        OUTPUT_DETAIL.write_text(detail_html, encoding="utf-8")
+        write_json_atomic(LATEST_JSON, payload)
 
-    html = HTML.replace("%%DATA%%", json.dumps(payload, separators=(',',':')))
-    html = html.replace("%%GEN%%", payload["generated"])
-    OUTPUT_HTML.write_text(html, encoding="utf-8")
+        daily = payload.get("daily", [])
+        weekly = payload.get("weekly", [])
+        monthly = payload.get("monthly", [])
+        streaks = payload.get("streaks", [])
 
-    # Generate habit detail page with data embedded
-    detail_data = json.dumps(payload, separators=(',',':'))
-    detail_html = DETAIL_TEMPLATE.replace("%%DETAIL_DATA%%", detail_data)
-    OUTPUT_DETAIL.write_text(detail_html, encoding="utf-8")
-
-    print(f"\nDone! → {OUTPUT_HTML.name} + {OUTPUT_DETAIL.name}")
-    print(f"  {len(daily)} days  ·  {len(weekly)} weeks  ·  {len(monthly)} months")
-    print(f"  Current PGI: {daily[-1]['pgi']}")
-    print(f"  Parse report: unmatched={len(run_report['unmatched_habits'])}, skipped_checked_days={run_report['skipped_checked_days']}")
-    print(f"\n  Habit streaks:")
-    for s in streaks:
-        bar = "█" * min(s["cur"], 20)
-        print(f"    {s['name']:20}  streak={s['cur']:3}  best={s['best']:3}  rate={s['rate']:3}%  {bar}")
-    print(f"\nOpen PGI_Dashboard.html in your browser.")
+        print(f"\nDone! → {OUTPUT_HTML.name} + {OUTPUT_DETAIL.name}")
+        print(f"  {len(daily)} days  ·  {len(weekly)} weeks  ·  {len(monthly)} months")
+        if daily:
+            print(f"  Current PGI: {daily[-1]['pgi']}")
+        print(f"  Parse report: unmatched={len(run_report['unmatched_habits'])}, skipped_checked_days={run_report['skipped_checked_days']}")
+        print(f"\n  Habit streaks:")
+        for s in streaks:
+            bar = "█" * min(s["cur"], 20)
+            print(f"    {s['name']:20}  streak={s['cur']:3}  best={s['best']:3}  rate={s['rate']:3}%  {bar}")
+        print(f"\nOpen PGI_Dashboard.html in your browser.")
 
 if __name__ == "__main__":
     main()
