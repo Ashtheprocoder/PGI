@@ -3,10 +3,31 @@ set -euo pipefail
 
 python3 -m unittest tests/test_refresh_smoke.py
 
+<<<<<<< ours
+<<<<<<< ours
+# Use rg if available, otherwise fallback to grep
+if command -v rg >/dev/null 2>&1; then
+  git ls-files | rg '\.DS_Store$' >/dev/null && {
+    echo "Tracked .DS_Store file found"
+    exit 1
+  } || true
+else
+  git ls-files | grep -E '\.DS_Store$' >/dev/null && {
+    echo "Tracked .DS_Store file found"
+    exit 1
+  } || true
+fi
+=======
+=======
+>>>>>>> theirs
 git ls-files | rg '\\.DS_Store$' >/dev/null && {
   echo "Tracked .DS_Store file found"
   exit 1
 } || true
+<<<<<<< ours
+>>>>>>> theirs
+=======
+>>>>>>> theirs
 
 [[ -f docs/roadmap.md ]]
 [[ -f docs/skills-playbook.md ]]

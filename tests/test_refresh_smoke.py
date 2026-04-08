@@ -35,6 +35,41 @@ class RefreshSmokeTests(unittest.TestCase):
             finally:
                 rd.LATEST_JSON = old
 
+<<<<<<< ours
+<<<<<<< ours
+=======
+=======
+>>>>>>> theirs
+    def test_build_mvp_overview_empty_inputs(self):
+        mvp = rd.build_mvp_overview([], [], {"projects": [], "open_tasks": [], "connected": False}, 0)
+        self.assertEqual(mvp["unified_model_version"], 1)
+        self.assertEqual(mvp["tasks_overview"]["open_total"], 0)
+        self.assertEqual(mvp["weekly_review"]["win_rate"], 0.0)
+
+<<<<<<< ours
+>>>>>>> theirs
+=======
+    def test_generate_execution_insights_adds_execution_block(self):
+        daily = [
+            {
+                "date": "2026-04-01",
+                "agg": 5,
+                "habits": {h: 1 for h in rd.HABIT_NAMES},
+                "streaks": {h: 1 for h in rd.HABIT_NAMES},
+            },
+            {
+                "date": "2026-04-02",
+                "agg": 0,
+                "habits": {h: 0 for h in rd.HABIT_NAMES},
+                "streaks": {h: 0 for h in rd.HABIT_NAMES},
+            },
+        ]
+        out = rd.generate_execution_insights(daily)
+        self.assertIn("execution", out[0])
+        self.assertIn("missed_high_value", out[1]["execution"])
+        self.assertIsInstance(out[1]["execution"]["efficiency"], float)
+
+>>>>>>> theirs
 
 if __name__ == "__main__":
     unittest.main()

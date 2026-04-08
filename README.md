@@ -58,6 +58,27 @@ This regenerates:
 - `habit_detail.html`
 - `data/latest.json`
 
+<<<<<<< ours
+<<<<<<< ours
+=======
+=======
+>>>>>>> theirs
+## Unified MVP payload (new)
+
+`data/latest.json` now includes an `mvp` object (backward-compatible additive field) for the first MVP dashboard slices:
+
+- `sync_status`
+- `tasks_overview`
+- `projects_overview`
+- `deadline_visibility`
+- `current_focus`
+- `growth_score`
+- `weekly_review`
+
+<<<<<<< ours
+>>>>>>> theirs
+=======
+>>>>>>> theirs
 ## Data flow and scoring
 
 1. Script finds latest `habits-*.json` export.
