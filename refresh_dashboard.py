@@ -1,6 +1,5 @@
 """
 PGI Dashboard Refresher — thefor app edition
-=============================================
 Reads your thefor habit export JSON + optional PGI Excel history,
 computes per-habit streaks, and regenerates the dashboard.
 
@@ -927,6 +926,113 @@ def fetch_todoist():
         print(f"    Todoist error: {e} — skipping tasks")
         return {}
 
+def fetch_todoist_overview():
+    import urllib.request, urllib.error
+    if not TODOIST_TOKEN:
+        return {"projects": [], "open_tasks": [], "sync_error": None, "connected": False}
+
+    headers = {"Authorization": f"Bearer {TODOIST_TOKEN}"}
+    out = {"projects": [], "open_tasks": [], "sync_error": None, "connected": True}
+    try:
+        # Open tasks (REST API)
+        req_tasks = urllib.request.Request("https://api.todoist.com/rest/v2/tasks", headers=headers)
+        with urllib.request.urlopen(req_tasks, timeout=15) as r:
+            out["open_tasks"] = json.loads(r.read())
+
+        # Projects (REST API)
+        req_projects = urllib.request.Request("https://api.todoist.com/rest/v2/projects", headers=headers)
+        with urllib.request.urlopen(req_projects, timeout=15) as r:
+            out["projects"] = json.loads(r.read())
+    except urllib.error.URLError as e:
+        out["sync_error"] = str(e)
+    except Exception as e:
+        out["sync_error"] = str(e)
+    return out
+
+def build_mvp_overview(daily, streaks, todoist_overview, excel_rows_count):
+    today = date.today()
+    last7 = daily[-7:] if daily else []
+    wins = sum(1 for d in last7 if d.get("agg", 0) > 0)
+    losses = sum(1 for d in last7 if d.get("agg", 0) < 0)
+    weekly_net = round(sum(d.get("agg", 0) for d in last7), 1) if last7 else 0
+    last = daily[-1] if daily else {"pgi": 0, "mw": 0}
+
+    focus = sorted(streaks, key=lambda s: (s.get("cur", 0), s.get("points", 0)), reverse=True)[:3]
+    current_focus = [{"name": s["name"], "streak": s["cur"], "rate": s["rate"]} for s in focus]
+
+    projects = todoist_overview.get("projects", []) if isinstance(todoist_overview, dict) else []
+    open_tasks = todoist_overview.get("open_tasks", []) if isinstance(todoist_overview, dict) else []
+    project_name = {p.get("id"): p.get("name", "Unknown") for p in projects if isinstance(p, dict)}
+    counts_by_project = defaultdict(int)
+
+    due_today = overdue = due_7d = 0
+    upcoming = []
+    for t in open_tasks:
+        if not isinstance(t, dict):
+            continue
+        counts_by_project[t.get("project_id")] += 1
+        due = t.get("due") or {}
+        due_str = due.get("date", "")[:10] if isinstance(due, dict) else str(due)[:10]
+        if due_str:
+            try:
+                due_date = date.fromisoformat(due_str)
+                if due_date < today:
+                    overdue += 1
+                if due_date == today:
+                    due_today += 1
+                if today <= due_date <= (today + timedelta(days=7)):
+                    due_7d += 1
+                upcoming.append({
+                    "content": t.get("content", ""),
+                    "project": project_name.get(t.get("project_id"), "Unknown"),
+                    "due": due_str,
+                })
+            except Exception:
+                pass
+
+    top_projects = sorted(
+        [{"name": project_name.get(pid, "Unknown"), "open_tasks": c} for pid, c in counts_by_project.items()],
+        key=lambda x: x["open_tasks"],
+        reverse=True,
+    )[:5]
+    upcoming = sorted(upcoming, key=lambda x: x["due"])[:10]
+
+    return {
+        "unified_model_version": 1,
+        "sync_status": {
+            "thefor_connected": True,
+            "excel_rows_merged": excel_rows_count,
+            "todoist_connected": bool(todoist_overview.get("connected")),
+            "todoist_sync_error": todoist_overview.get("sync_error"),
+        },
+        "tasks_overview": {
+            "open_total": len(open_tasks),
+            "due_today": due_today,
+            "overdue": overdue,
+            "due_next_7_days": due_7d,
+        },
+        "projects_overview": top_projects,
+        "deadline_visibility": {
+            "overdue_count": overdue,
+            "due_today_count": due_today,
+            "upcoming_count": len(upcoming),
+            "upcoming_items": upcoming,
+        },
+        "current_focus": current_focus,
+        "growth_score": {
+            "current_pgi": last.get("pgi", 0),
+            "momentum_7d": last.get("mw", 0),
+            "simple_score": round(last.get("pgi", 0) + max(0, last.get("mw", 0)) * 10, 1),
+        },
+        "weekly_review": {
+            "window_days": len(last7),
+            "wins": wins,
+            "losses": losses,
+            "net_points": weekly_net,
+            "win_rate": round((wins / (wins + losses) * 100), 1) if (wins + losses) else 0.0,
+        },
+    }
+
 # ── Merge excel history + thefor rows ────────────────────────────────────────
 def merge(excel_rows, day_map, task_map=None):
     task_map = task_map or {}
@@ -985,6 +1091,112 @@ def calc_metrics(rows):
             "streaks": dict(streaks),
         })
     return out
+
+def generate_execution_insights(daily_data):
+    if not daily_data:
+        return daily_data
+
+    high_value_habits = [h for h in HABIT_NAMES if HABIT_CONFIG[h]["points"] >= 2]
+
+    for i, day in enumerate(daily_data):
+        habits = day.get("habits", {})
+        agg = day.get("agg", 0)
+
+        # --- Efficiency (normalized 0–1) ---
+        max_pts = sum(HABIT_CONFIG[h]["points"] for h in HABIT_NAMES)
+        min_pts = -len(HABIT_NAMES)
+        range_pts = max_pts - min_pts
+
+        efficiency_raw = (agg - min_pts) / range_pts if range_pts else 0.0
+        efficiency = round(min(1.0, max(0.0, efficiency_raw)), 3)
+
+        # --- Missed high-value habits ---
+        missed_high_value = [h for h in high_value_habits if not habits.get(h, 0)]
+
+        # --- Weakest habit (7-day window) ---
+        window = daily_data[max(0, i - 6): i + 1]
+        miss_counts = {h: 0 for h in HABIT_NAMES}
+        for d in window:
+            for h in HABIT_NAMES:
+                if not d.get("habits", {}).get(h, 0):
+                    miss_counts[h] += 1
+
+        weighted_miss = {
+            h: miss_counts[h] * HABIT_CONFIG[h]["points"] for h in HABIT_NAMES
+        }
+        weakest_habit = max(weighted_miss, key=weighted_miss.get) if weighted_miss else ""
+
+        # --- Streak break ---
+        streak_break = []
+        if i > 0:
+            prev_streaks = daily_data[i - 1].get("streaks", {})
+            curr_streaks = day.get("streaks", {})
+            for h in HABIT_NAMES:
+                if prev_streaks.get(h, 0) > 0 and curr_streaks.get(h, 0) == 0:
+                    streak_break.append(h)
+
+        # --- Trend ---
+        trend = "stable"
+        if i >= 5:
+            last3 = daily_data[i - 2:i + 1]
+            prev3 = daily_data[i - 5:i - 2]
+            avg_last3 = sum(d.get("agg", 0) for d in last3) / 3
+            avg_prev3 = sum(d.get("agg", 0) for d in prev3) / 3
+            delta = avg_last3 - avg_prev3
+
+            if delta > 1.5:
+                trend = "improving"
+            elif delta < -1.5:
+                trend = "declining"
+
+        # --- Severity ---
+        if efficiency < 0.3:
+            severity = "high"
+        elif efficiency <= 0.6:
+            severity = "medium"
+        else:
+            severity = "low"
+
+        # --- Insight ---
+        weakest_persistent = miss_counts.get(weakest_habit, 0) >= 4 if weakest_habit else False
+
+        if len(missed_high_value) >= 2:
+            insight = f"You missed multiple high-impact habits: {missed_high_value[0]}, {missed_high_value[1]}."
+        elif missed_high_value:
+            insight = f"You missed {missed_high_value[0]}, which has the highest impact on your PGI."
+        elif weakest_persistent:
+            insight = f"{weakest_habit} is your most persistent weak point in the last 7 days."
+        elif trend == "declining":
+            insight = "Your execution is declining over the last 3 days. You are entering a breakdown phase."
+        elif all(habits.get(h, 0) for h in HABIT_NAMES):
+            insight = "Strong execution. This is the standard to maintain."
+        else:
+            insight = "Execution is stable. Protect momentum."
+
+        # --- Priority action ---
+        if len(missed_high_value) >= 2:
+            priority_action = f"Today: Complete {missed_high_value[0]} first before 12 PM, then {missed_high_value[1]} immediately after."
+        elif missed_high_value:
+            priority_action = f"Today: Complete {missed_high_value[0]} before 12 PM (non-negotiable)."
+        elif weakest_persistent:
+            priority_action = f"Today: Set a fixed time block for {weakest_habit}."
+        elif trend == "declining":
+            priority_action = "Today: Protect momentum — follow a tighter schedule."
+        else:
+            priority_action = "Today: Repeat this structure."
+
+        day["execution"] = {
+            "efficiency": efficiency,
+            "missed_high_value": missed_high_value,
+            "weakest_habit": weakest_habit,
+            "streak_break": streak_break,
+            "trend": trend,
+            "severity": severity,
+            "insight": insight,
+            "priority_action": priority_action,
+        }
+
+    return daily_data
 
 # ── Per-habit streak summary for streak cards ─────────────────────────────────
 def streak_summary(daily):
@@ -1445,9 +1657,21 @@ def main():
                 if task_map:
                     total_tasks = sum(v["total"] for v in task_map.values())
                     print(f"  Todoist: {total_tasks} completed tasks across {len(task_map)} days")
+                todoist_overview = fetch_todoist_overview()
+                if task_map:
+                    total_tasks = sum(v["total"] for v in task_map.values())
+                    print(f"  Todoist: {total_tasks} completed tasks across {len(task_map)} days")
+                if todoist_overview.get("connected"):
+                    print(f"  Todoist open tasks: {len(todoist_overview.get('open_tasks', []))}")
+                if todoist_overview.get("sync_error"):
+                    print(f"  Todoist overview sync warning: {todoist_overview['sync_error']}")
 
                 all_rows = merge(excel_rows, day_map, task_map)
                 daily    = calc_metrics(all_rows)
+
+                all_rows = merge(excel_rows, day_map, task_map)
+                daily    = calc_metrics(all_rows)
+                daily    = generate_execution_insights(daily)
                 weekly, monthly = aggregates(daily)
                 streaks  = streak_summary(daily)
 
@@ -1456,6 +1680,8 @@ def main():
                     "weekly":   weekly,
                     "monthly":  monthly,
                     "streaks":  streaks,
+                    "mvp":      build_mvp_overview(daily, streaks, todoist_overview, len(excel_rows)),
+                    "mvp":      build_mvp_overview(daily, streaks, todoist_overview, len(excel_rows)),
                     "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 }
 
