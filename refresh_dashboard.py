@@ -45,6 +45,7 @@ HABITS = [
 HABIT_CONFIG = {h[0]: {"type": h[1], "points": h[2], "color": h[3]} for h in HABITS}
 HABIT_NAMES  = [h[0] for h in HABITS]
 MAX_PTS      = sum(h[2] for h in HABITS if h[2] > 0)
+HABIT_ALIASES = {}
 
 SCRIPT_DIR  = Path(__file__).parent
 EXCEL_FILE  = SCRIPT_DIR / "PGI_v3.xlsx"
@@ -866,87 +867,34 @@ def load_excel(cutoff):
 
 # ── Fetch Todoist completed tasks → {date_str: {on_time: N, overdue: N, no_due: N}} ──
 def fetch_todoist():
-    import urllib.request, urllib.error
-    if not TODOIST_TOKEN:
-        return {}
-
-    print("  Fetching Todoist completed tasks...")
-    task_map = defaultdict(lambda: {"on_time": 0, "overdue": 0, "no_due": 0, "total": 0})
-
-    try:
-        # Sync API to get completed items (supports full history)
-        url = "https://api.todoist.com/sync/v9/items/completed/get_all"
-        req = urllib.request.Request(
-            url,
-            headers={"Authorization": f"Bearer {TODOIST_TOKEN}"}
-        )
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read())
-
-        items = data.get("items", [])
-        print(f"    Found {len(items)} completed tasks")
-
-        for item in items:
-            # completed_at is like "2025-06-15T14:23:00.000000Z"
-            completed_raw = item.get("completed_at") or item.get("date_completed", "")
-            if not completed_raw:
-                continue
-            try:
-                completed_date = datetime.fromisoformat(
-                    completed_raw.replace("Z","").split("T")[0]
-                ).date()
-            except Exception:
-                continue
-
-            ds = str(completed_date)
-
-            # Check if it had a due date and whether it was on time
-            due = item.get("due")
-            if not due:
-                task_map[ds]["no_due"]  += 1
-            else:
-                due_str = due.get("date","")[:10] if isinstance(due, dict) else str(due)[:10]
-                try:
-                    due_date = date.fromisoformat(due_str)
-                    if completed_date <= due_date:
-                        task_map[ds]["on_time"]  += 1
-                    else:
-                        task_map[ds]["overdue"] += 1
-                except Exception:
-                    task_map[ds]["no_due"] += 1
-
-            task_map[ds]["total"] += 1
-
-        return dict(task_map)
-
-    except urllib.error.URLError as e:
-        print(f"    Todoist unavailable: {e} — skipping tasks")
-        return {}
-    except Exception as e:
-        print(f"    Todoist error: {e} — skipping tasks")
-        return {}
-
+    print("⚠️ Old Todoist function disabled (deprecated API)")
+    return {}
 def fetch_todoist_overview():
-    import urllib.request, urllib.error
+    import requests
+
     if not TODOIST_TOKEN:
         return {"projects": [], "open_tasks": [], "sync_error": None, "connected": False}
 
-    headers = {"Authorization": f"Bearer {TODOIST_TOKEN}"}
-    out = {"projects": [], "open_tasks": [], "sync_error": None, "connected": True}
-    try:
-        # Open tasks (REST API)
-        req_tasks = urllib.request.Request("https://api.todoist.com/rest/v2/tasks", headers=headers)
-        with urllib.request.urlopen(req_tasks, timeout=15) as r:
-            out["open_tasks"] = json.loads(r.read())
+    headers = {
+        "Authorization": f"Bearer {TODOIST_TOKEN}"
+    }
 
-        # Projects (REST API)
-        req_projects = urllib.request.Request("https://api.todoist.com/rest/v2/projects", headers=headers)
-        with urllib.request.urlopen(req_projects, timeout=15) as r:
-            out["projects"] = json.loads(r.read())
-    except urllib.error.URLError as e:
-        out["sync_error"] = str(e)
+    out = {"projects": [], "open_tasks": [], "sync_error": None, "connected": True}
+
+    try:
+        # Open tasks
+        tasks_res = requests.get("https://api.todoist.com/rest/v2/tasks", headers=headers)
+        tasks_res.raise_for_status()
+        out["open_tasks"] = tasks_res.json()
+
+        # Projects
+        projects_res = requests.get("https://api.todoist.com/rest/v2/projects", headers=headers)
+        projects_res.raise_for_status()
+        out["projects"] = projects_res.json()
+
     except Exception as e:
         out["sync_error"] = str(e)
+
     return out
 
 def build_mvp_overview(daily, streaks, todoist_overview, excel_rows_count):
@@ -1112,6 +1060,7 @@ def generate_execution_insights(daily_data):
 
         # --- Missed high-value habits ---
         missed_high_value = [h for h in high_value_habits if not habits.get(h, 0)]
+        focus_score = round(1 - (len(missed_high_value) / len(high_value_habits)), 3) if high_value_habits else 0.0
 
         # --- Weakest habit (7-day window) ---
         window = daily_data[max(0, i - 6): i + 1]
@@ -1187,6 +1136,7 @@ def generate_execution_insights(daily_data):
 
         day["execution"] = {
             "efficiency": efficiency,
+            "focus_score": focus_score,
             "missed_high_value": missed_high_value,
             "weakest_habit": weakest_habit,
             "streak_break": streak_break,
@@ -1264,7 +1214,10 @@ HTML = r"""<!DOCTYPE html>
 <style>
 :root{--bg:#fff;--bg2:#f8f8f6;--bg3:#f2f1ed;--text:#1a1a1a;--text2:#6b6a65;--text3:#9b9a94;
   --bdr:rgba(0,0,0,0.1);--teal:#0f6e56;--teal-l:#e1f5ee;--blue:#185fa5;
-  --red:#a32d2d;--red-l:#fcebeb;--amber:#ba7517;--amber-l:#faeeda;--r:12px;--rs:8px}
+  --red:#a32d2d;--red-l:#fcebeb;--amber:#ba7517;--amber-l:#faeeda;--r:12px;--rs:8px;
+  --color-bg-secondary:var(--bg);--color-border:var(--bdr);--color-text-primary:var(--text);
+  --color-text-secondary:var(--text2);--color-error:var(--red);--color-warning:var(--amber);
+  --color-success:var(--teal);--color-accent:var(--blue)}
 @media(prefers-color-scheme:dark){:root{--bg:#1a1a1e;--bg2:#222226;--bg3:#2a2a2e;
   --text:#e8e7e2;--text2:#9b9a94;--text3:#6b6a65;--bdr:rgba(255,255,255,0.1);
   --teal-l:#04342c;--red-l:#501313;--amber-l:#412402}}
@@ -1286,6 +1239,68 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
      border:none;background:transparent;color:var(--text2);transition:all .15s}
 .tab.active{background:var(--bg);color:var(--text);box-shadow:0 1px 3px rgba(0,0,0,.08)}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+
+/* ── Execution panel ─────────────────────────────────────────── */
+.execution-panel {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
+  font-family: system-ui;
+}
+
+.execution-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.execution-title {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.execution-severity {
+  font-size: 13px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+
+.execution-severity.high {
+  color: var(--color-error);
+}
+
+.execution-severity.medium {
+  color: var(--color-warning);
+}
+
+.execution-severity.low {
+  color: var(--color-success);
+}
+
+.execution-insight {
+  font-size: 15px;
+  color: var(--color-text-primary);
+  margin-bottom: 8px;
+}
+
+.execution-action {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--color-accent);
+  margin-bottom: 12px;
+}
+
+.execution-metrics {
+  display: flex;
+  gap: 16px;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
 
 /* ── Streak cards ─────────────────────────────────────────────── */
 .sgrid-wrap{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
@@ -1333,6 +1348,22 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 </style>
 </head>
 <body><div class="app">
+
+<div id="execution-panel" class="execution-panel">
+  <div class="execution-header">
+    <span class="execution-title">Execution</span>
+    <span id="execution-severity" class="execution-severity"></span>
+  </div>
+
+  <div id="execution-insight" class="execution-insight"></div>
+
+  <div id="execution-action" class="execution-action"></div>
+
+  <div class="execution-metrics">
+    <div>Efficiency: <span id="execution-efficiency"></span></div>
+    <div>Focus: <span id="execution-focus"></span></div>
+  </div>
+</div>
 
 <div class="hrow">
   <h1>PGI Dashboard</h1>
@@ -1413,6 +1444,18 @@ function rk(p){
 const daily=D.daily, monthly=D.monthly, weekly=D.weekly;
 const streaks=D.streaks;
 const last=daily[daily.length-1];
+const exec=last.execution;
+
+if(exec){
+  document.getElementById("execution-insight").textContent = exec.insight;
+  document.getElementById("execution-action").textContent = exec.priority_action;
+  document.getElementById("execution-efficiency").textContent = Math.round(exec.efficiency * 100) + "%";
+  document.getElementById("execution-focus").textContent = Math.round((exec.focus_score ?? exec.efficiency) * 100) + "%";
+
+  const severityEl = document.getElementById("execution-severity");
+  severityEl.textContent = exec.severity.toUpperCase();
+  severityEl.className = "execution-severity " + exec.severity;
+}
 
 // ── Summary cards ─────────────────────────────────────────────────────────────
 const r2=rk(last.pgi);
